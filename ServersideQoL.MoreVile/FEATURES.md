@@ -1,0 +1,2 @@
+- Increases the natural spawn chance of Viles
+- Optionally lets 1-star and 2-star Viles spawn naturally
