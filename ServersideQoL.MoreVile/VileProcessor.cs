@@ -22,6 +22,7 @@ public sealed class VileProcessor : Processor<VileProcessor.PrefabInfo>
   readonly Dictionary<int, float> _noSpawnAreaRadiusByPrefab = [];
   readonly Dictionary<(long PeerID, int SpawnDataIndex), float> _nextRollTime = [];
   readonly List<ZDO> _sectorObjects = [];
+  readonly List<(float ChanceMultiplier, int? Level)> _variants = [];
 
   public sealed record PrefabInfo(Character Character) : ProcessorPrefabInfo
   {
@@ -58,8 +59,19 @@ public sealed class VileProcessor : Processor<VileProcessor.PrefabInfo>
 
   protected override void PreProcess(PeersEnumerable peers)
   {
-    var extraChance = Config.Instance.SpawnChanceMultiplier.Value - 1f;
-    if (extraChance <= 0 || _spawnData.Count is 0)
+    if (_spawnData.Count is 0)
+      return;
+
+    // Each variant is rolled independently, relative to the vanilla spawn chance of regular Viles.
+    // Level null: level is rolled like in vanilla, otherwise fixed (level = stars + 1)
+    _variants.Clear();
+    if (Config.Instance.SpawnChanceMultiplier.Value > 1f)
+      _variants.Add((Config.Instance.SpawnChanceMultiplier.Value - 1f, null)); // only the additional chance, vanilla rolls the rest
+    if (Config.Instance.SpawnOneStarViles.Value && Config.Instance.OneStarSpawnChanceMultiplier.Value > 0f)
+      _variants.Add((Config.Instance.OneStarSpawnChanceMultiplier.Value, 2));
+    if (Config.Instance.SpawnTwoStarViles.Value && Config.Instance.TwoStarSpawnChanceMultiplier.Value > 0f)
+      _variants.Add((Config.Instance.TwoStarSpawnChanceMultiplier.Value, 3));
+    if (_variants.Count is 0)
       return;
 
     var now = Time.time;
@@ -81,31 +93,34 @@ public sealed class VileProcessor : Processor<VileProcessor.PrefabInfo>
         if (!CanSpawnNow(data))
           continue;
 
-        // Same roll as SpawnSystem, but only for the additional chance
-        var rolls = 0;
-        for (var chance = data.m_spawnChance * extraChance; chance > 0; chance -= 100f)
+        foreach (var (multiplier, level) in _variants)
         {
-          if (UnityEngine.Random.Range(0f, 100f) <= chance)
-            rolls++;
-        }
-        if (rolls is 0)
-          continue;
+          // Same roll as SpawnSystem, chances > 100% result in multiple spawns
+          var rolls = 0;
+          for (var chance = data.m_spawnChance * multiplier; chance > 0; chance -= 100f)
+          {
+            if (UnityEngine.Random.Range(0f, 100f) <= chance)
+              rolls++;
+          }
+          if (rolls is 0)
+            continue;
 
-        if (!sectorObjectsLoaded)
-        {
-          _sectorObjects.Clear();
-          ZDOMan.instance.FindSectorObjects(peer.GetSector(), ZNet.instance.GetSyncedSimulationDistance(), _sectorObjects);
-          sectorObjectsLoaded = true;
-        }
+          if (!sectorObjectsLoaded)
+          {
+            _sectorObjects.Clear();
+            ZDOMan.instance.FindSectorObjects(peer.GetSector(), ZNet.instance.GetSyncedSimulationDistance(), _sectorObjects);
+            sectorObjectsLoaded = true;
+          }
 
-        for (int r = 0; r < rolls; r++)
-        {
-          var maxSpawned = Mathf.RoundToInt(data.m_maxSpawned * Config.Instance.MaxSpawnedMultiplier.Value);
-          if (_sectorObjects.Count(static x => x.GetPrefab() == __vilePrefab) >= maxSpawned)
-            break;
-          if (FindSpawnPoint(data, playerPos, peers) is not { } spawnPoint)
-            break;
-          SpawnGroup(data, spawnPoint);
+          for (int r = 0; r < rolls; r++)
+          {
+            var maxSpawned = Mathf.RoundToInt(data.m_maxSpawned * Config.Instance.MaxSpawnedMultiplier.Value);
+            if (_sectorObjects.Count(static x => x.GetPrefab() == __vilePrefab) >= maxSpawned)
+              break;
+            if (FindSpawnPoint(data, playerPos, peers) is not { } spawnPoint)
+              break;
+            SpawnGroup(data, spawnPoint, level);
+          }
         }
       }
     }
@@ -199,7 +214,7 @@ public sealed class VileProcessor : Processor<VileProcessor.PrefabInfo>
     return true;
   }
 
-  void SpawnGroup(SpawnSystem.SpawnData data, Vector3 spawnPoint)
+  void SpawnGroup(SpawnSystem.SpawnData data, Vector3 spawnPoint, int? fixedLevel)
   {
     var count = UnityEngine.Random.Range(data.m_groupSizeMin, data.m_groupSizeMax + 1);
     for (int i = 0; i < count; i++)
@@ -213,10 +228,16 @@ public sealed class VileProcessor : Processor<VileProcessor.PrefabInfo>
       }
       pos.y += data.m_groundOffset + UnityEngine.Random.Range(0f, data.m_groundOffsetRandom);
 
-      var level = data.m_minLevel;
-      var levelUpChance = SpawnSystem.GetLevelUpChance(pos, data);
-      while (level < data.m_maxLevel && UnityEngine.Random.Range(0f, 100f) <= levelUpChance)
-        level++;
+      int level;
+      if (fixedLevel is not null)
+        level = fixedLevel.Value;
+      else
+      {
+        level = data.m_minLevel;
+        var levelUpChance = SpawnSystem.GetLevelUpChance(pos, data);
+        while (level < data.m_maxLevel && UnityEngine.Random.Range(0f, 100f) <= levelUpChance)
+          level++;
+      }
 
       var zdo = Spawn(__vilePrefab, pos, Quaternion.Euler(0, UnityEngine.Random.Range(0f, 360f), 0));
       if (level > 1)
@@ -225,6 +246,6 @@ public sealed class VileProcessor : Processor<VileProcessor.PrefabInfo>
         zdo.ZDO.Set(ZDOVars.s_huntPlayer, true);
       _sectorObjects.Add(zdo.ZDO);
     }
-    Logger.DevLog($"Spawned {count} {VilePrefabName} at {spawnPoint}");
+    Logger.DevLog($"Spawned {count} {VilePrefabName} (level {fixedLevel?.ToString() ?? "rolled"}) at {spawnPoint}");
   }
 }
