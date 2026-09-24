@@ -42,6 +42,18 @@ public sealed class VileProcessor : Processor<VileProcessor.PrefabInfo>
     if (_spawnData.Count is 0)
       Logger.LogWarning($"No natural spawn data found for {VilePrefabName}");
 
+    foreach (var data in _spawnData)
+    {
+      var key = string.IsNullOrEmpty(data.m_requiredGlobalKey) ? "none" :
+        $"{data.m_requiredGlobalKey} ({(ZoneSystem.instance.GetGlobalKey(data.m_requiredGlobalKey) ? "set" : "NOT set")})";
+      Logger.LogInfo($"{VilePrefabName} spawn data '{data.m_name}': biome: {data.m_biome}, area: {data.m_biomeArea}, " +
+        $"day: {data.m_spawnAtDay}, night: {data.m_spawnAtNight}, chance: {data.m_spawnChance}%, interval: {data.m_spawnInterval}s, " +
+        $"max spawned: {data.m_maxSpawned}, group: {data.m_groupSizeMin}-{data.m_groupSizeMax}, levels: {data.m_minLevel}-{data.m_maxLevel}, " +
+        $"required key: {key}, required environments: [{string.Join(", ", data.m_requiredEnvironments ?? [])}], " +
+        $"required event: '{data.m_requiredPersistentEvent}', altitude: {data.m_minAltitude}-{data.m_maxAltitude}, " +
+        $"forest: in {data.m_inForest}/out {data.m_outsideForest}, radius: {data.m_spawnRadiusMin}-{data.m_spawnRadiusMax}");
+    }
+
     _noSpawnAreaRadiusByPrefab.Clear();
     foreach (var prefab in ZNetScene.instance.m_prefabs)
     {
@@ -74,6 +86,7 @@ public sealed class VileProcessor : Processor<VileProcessor.PrefabInfo>
     if (_variants.Count is 0)
       return;
 
+    var diagnostics = ServersideQoL.Config.Instance.DiagnosticLogs.Value;
     var now = Time.time;
     foreach (var peer in peers)
     {
@@ -90,8 +103,12 @@ public sealed class VileProcessor : Processor<VileProcessor.PrefabInfo>
         var data = _spawnData[i];
         _nextRollTime[key] = now + data.m_spawnInterval;
 
-        if (!CanSpawnNow(data))
+        if (GetCannotSpawnReason(data) is { } cannotSpawnReason)
+        {
+          if (diagnostics)
+            Logger.LogInfo($"{VilePrefabName} roll near {playerPos}: skipped, {cannotSpawnReason}");
           continue;
+        }
 
         foreach (var (multiplier, level) in _variants)
         {
@@ -102,6 +119,8 @@ public sealed class VileProcessor : Processor<VileProcessor.PrefabInfo>
             if (UnityEngine.Random.Range(0f, 100f) <= chance)
               rolls++;
           }
+          if (diagnostics)
+            Logger.LogInfo($"{VilePrefabName} roll near {playerPos} (level {level?.ToString() ?? "rolled"}): chance {data.m_spawnChance * multiplier}%, {rolls} successful roll(s)");
           if (rolls is 0)
             continue;
 
@@ -115,11 +134,16 @@ public sealed class VileProcessor : Processor<VileProcessor.PrefabInfo>
           for (int r = 0; r < rolls; r++)
           {
             var maxSpawned = Mathf.RoundToInt(data.m_maxSpawned * Config.Instance.MaxSpawnedMultiplier.Value);
-            if (_sectorObjects.Count(static x => x.GetPrefab() == __vilePrefab) >= maxSpawned)
+            var nearby = _sectorObjects.Count(static x => x.GetPrefab() == __vilePrefab);
+            if (nearby >= maxSpawned)
+            {
+              if (diagnostics)
+                Logger.LogInfo($"{VilePrefabName}: max spawned reached ({nearby}/{maxSpawned})");
               break;
-            if (FindSpawnPoint(data, playerPos, peers) is not { } spawnPoint)
+            }
+            if (FindSpawnPoint(data, playerPos, peers, diagnostics) is not { } spawnPoint)
               break;
-            SpawnGroup(data, spawnPoint, level);
+            SpawnGroup(data, spawnPoint, level, diagnostics);
           }
         }
       }
@@ -130,69 +154,73 @@ public sealed class VileProcessor : Processor<VileProcessor.PrefabInfo>
   protected override ProcessResult Process(ServersideQoLZDO zdo, IReadOnlyList<Peer> peers, PrefabInfo prefabInfo)
     => ProcessResult.UnregisterProcessor;
 
-  static bool CanSpawnNow(SpawnSystem.SpawnData data)
+  static string? GetCannotSpawnReason(SpawnSystem.SpawnData data)
   {
     if (!string.IsNullOrEmpty(data.m_requiredGlobalKey) && !ZoneSystem.instance.GetGlobalKey(data.m_requiredGlobalKey))
-      return false;
+      return $"required global key {data.m_requiredGlobalKey} not set";
     if (!string.IsNullOrEmpty(data.m_requiredPersistentEvent)) // not tracked by this mod, don't spawn to be safe
-      return false;
+      return $"requires event {data.m_requiredPersistentEvent}";
     if (!data.m_spawnAtDay && EnvMan.IsDay())
-      return false;
+      return "no spawns at day";
     if (!data.m_spawnAtNight && EnvMan.IsNight())
-      return false;
+      return "no spawns at night";
     // m_requiredEnvironments is ignored: weather is simulated by the clients and not known reliably on the server
-    return true;
+    return null;
   }
 
-  Vector3? FindSpawnPoint(SpawnSystem.SpawnData data, Vector3 playerPos, PeersEnumerable peers)
+  Vector3? FindSpawnPoint(SpawnSystem.SpawnData data, Vector3 playerPos, PeersEnumerable peers, bool diagnostics)
   {
     var radiusMin = data.m_spawnRadiusMin > 0 ? data.m_spawnRadiusMin : DefaultSpawnRadiusMin;
     var radiusMax = data.m_spawnRadiusMax > 0 ? data.m_spawnRadiusMax : DefaultSpawnRadiusMax;
+    List<string>? reasons = diagnostics ? [] : null;
     for (int i = 0; i < MaxSpawnPointTries; i++)
     {
       var dir = UnityEngine.Random.insideUnitCircle.normalized * UnityEngine.Random.Range(radiusMin, radiusMax);
       var pos = playerPos + new Vector3(dir.x, 0, dir.y);
       pos.y = GetHeight(pos);
-      if (IsSpawnPointGood(data, pos, radiusMin, peers))
+      if (GetBadSpawnPointReason(data, pos, radiusMin, peers) is not { } reason)
         return pos;
+      reasons?.Add(reason);
     }
+    if (reasons is not null)
+      Logger.LogInfo($"{VilePrefabName}: no spawn point found near {playerPos}: {string.Join(", ", reasons.GroupBy(static x => x).Select(static x => $"{x.Key} ({x.Count()}x)"))}");
     return null;
   }
 
-  bool IsSpawnPointGood(SpawnSystem.SpawnData data, Vector3 pos, float minPlayerDistance, PeersEnumerable peers)
+  string? GetBadSpawnPointReason(SpawnSystem.SpawnData data, Vector3 pos, float minPlayerDistance, PeersEnumerable peers)
   {
-    if ((data.m_biome & GetBiome(pos)) is 0)
-      return false;
-    if ((data.m_biomeArea & WorldGenerator.instance.GetBiomeArea(pos)) is 0)
-      return false;
+    if (GetBiome(pos) is var biome && (data.m_biome & biome) is 0)
+      return $"wrong biome {biome}";
+    if (WorldGenerator.instance.GetBiomeArea(pos) is var area && (data.m_biomeArea & area) is 0)
+      return $"wrong biome area {area}";
 
     var waterLevel = ZoneSystem.instance.m_waterLevel;
     var altitude = pos.y - waterLevel;
     if (altitude < data.m_minAltitude || altitude > data.m_maxAltitude)
-      return false;
+      return "altitude";
     if (data.m_minOceanDepth != data.m_maxOceanDepth && (-altitude < data.m_minOceanDepth || -altitude > data.m_maxOceanDepth))
-      return false;
+      return "ocean depth";
 
     var distanceFromCenter = Utils.LengthXZ(pos);
     if (data.m_minDistanceFromCenter > 0 && distanceFromCenter < data.m_minDistanceFromCenter)
-      return false;
+      return "too close to world center";
     if (data.m_maxDistanceFromCenter > 0 && distanceFromCenter > data.m_maxDistanceFromCenter)
-      return false;
+      return "too far from world center";
 
     var inForest = WorldGenerator.InForest(pos);
     if ((inForest && !data.m_inForest) || (!inForest && !data.m_outsideForest))
-      return false;
+      return inForest ? "in forest" : "outside forest";
 
     var inLava = GetHeightmap(pos).IsLava(pos, 0.6f);
     if ((inLava && !data.m_inLava) || (!inLava && !data.m_outsideLava))
-      return false;
+      return inLava ? "in lava" : "outside lava";
 
     if (!data.m_canSpawnCloseToPlayer)
     {
       foreach (var peer in peers)
       {
         if (Utils.DistanceXZ(peer.RefPos, pos) < minPlayerDistance)
-          return false;
+          return "close to player";
       }
     }
 
@@ -202,19 +230,19 @@ public sealed class VileProcessor : Processor<VileProcessor.PrefabInfo>
       if (prefab == __vilePrefab)
       {
         if (data.m_spawnDistance > 0 && Utils.DistanceXZ(zdo.GetPosition(), pos) < data.m_spawnDistance)
-          return false;
+          return "close to other Vile";
       }
       else if (!data.m_insidePlayerBase && _noSpawnAreaRadiusByPrefab.TryGetValue(prefab, out var radius) &&
         Utils.DistanceXZ(zdo.GetPosition(), pos) < radius)
       {
-        return false;
+        return "inside player base";
       }
     }
 
-    return true;
+    return null;
   }
 
-  void SpawnGroup(SpawnSystem.SpawnData data, Vector3 spawnPoint, int? fixedLevel)
+  void SpawnGroup(SpawnSystem.SpawnData data, Vector3 spawnPoint, int? fixedLevel, bool diagnostics)
   {
     var count = UnityEngine.Random.Range(data.m_groupSizeMin, data.m_groupSizeMax + 1);
     for (int i = 0; i < count; i++)
@@ -246,6 +274,7 @@ public sealed class VileProcessor : Processor<VileProcessor.PrefabInfo>
         zdo.ZDO.Set(ZDOVars.s_huntPlayer, true);
       _sectorObjects.Add(zdo.ZDO);
     }
-    Logger.DevLog($"Spawned {count} {VilePrefabName} (level {fixedLevel?.ToString() ?? "rolled"}) at {spawnPoint}");
+    if (diagnostics)
+      Logger.LogInfo($"Spawned {count} {VilePrefabName} (level {fixedLevel?.ToString() ?? "rolled"}) at {spawnPoint}");
   }
 }
